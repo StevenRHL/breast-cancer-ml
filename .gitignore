@@ -21,7 +21,9 @@ Thumbs.db
 .vscode/
 
 # Archives
+archive/
 *.zip
+!archive.zip
 
 # Data (uncomment if your data shouldn't be tracked)
 # data/
