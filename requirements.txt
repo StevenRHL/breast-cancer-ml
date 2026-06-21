@@ -1,0 +1,10 @@
+# Phase 0 environment — Python 3.11 venv on Apple Silicon (MPS).
+# Pinned to versions verified working with torch.backends.mps.is_available() == True.
+torch==2.12.1
+torchvision==0.27.1
+pillow==12.0.0
+numpy==2.3.5
+scikit-learn==1.9.0
+matplotlib==3.11.0
+# Phase 6 (interactive app) — add when reached:
+# gradio
