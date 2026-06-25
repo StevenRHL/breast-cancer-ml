@@ -41,9 +41,10 @@ visualization, built as a clinical decision-support **research** tool.
   | val   |       40 |          40,526 |             0.2861 |
   | test  |       45 |          46,898 |             0.2864 |
 
-  > The `archive/` raw dataset is **not** committed to this repo (4.2 GB). See
-  > [`archive/README.md`](archive/README.md) for the download link and expected
-  > layout.
+  > The `archive/` raw dataset is **not** committed to this repo (~3.3 GB zipped
+  > / ~4.2 GB extracted). Fetch it from Kaggle with `bash
+  > scripts/download_dataset.sh` (or `make data`) — see
+  > [Dataset download](#dataset-download) below.
 
 ## Model
 
@@ -117,7 +118,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # 3. Download the dataset (only needed for (re)training / evaluation, NOT the UI)
-#    See archive/README.md for the Kaggle link and expected folder layout.
+#    Needs the Kaggle CLI + API token; see scripts/download_dataset.sh header.
+bash scripts/download_dataset.sh
+#    (or download manually from Kaggle — see "Dataset download" below)
 
 # 4. Launch the interactive app
 PYTORCH_ENABLE_MPS_FALLBACK=1 python -m app.ui
@@ -141,10 +144,40 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python evaluate_patient.py   # patient-level
 PYTHONPATH=src python src/evaluate.py --arch resnet18      # patch-level
 ```
 
+## Dataset download
+
+The raw dataset (~3.3 GB zipped / ~4.2 GB extracted, 277,524 patches) is **not**
+committed to this repo. Only training and evaluation need it — the interactive
+app runs from the checkpoints in `checkpoints/`.
+
+**Source:** [Breast Histopathology Images (IDC), Kaggle](https://www.kaggle.com/datasets/paultimothymooney/breast-histopathology-images)
+
+**Automated (recommended)** — needs the Kaggle CLI and an API token:
+
+```bash
+pip install kaggle
+# Kaggle -> Account -> "Create New API Token" downloads kaggle.json:
+mkdir -p ~/.kaggle && mv ~/Downloads/kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
+bash scripts/download_dataset.sh     # or: make data
+```
+
+**Manual** — download the zip in a browser, save it as `./archive.zip`, then run
+`bash scripts/download_dataset.sh` (it skips the download and just extracts).
+
+**Expected layout after extraction** — `class 0` = non-IDC (benign),
+`class 1` = IDC (malignant):
+
+```
+archive/
+└── <patient_id>/
+    ├── 0/   # benign:    <id>_idx5_x<X>_y<Y>_class0.png
+    └── 1/   # malignant: <id>_idx5_x<X>_y<Y>_class1.png
+```
+
 ## Project structure
 
 ```
-archive/              Raw dataset (NOT in git; see archive/README.md)
+archive/              Raw dataset (NOT in git; see "Dataset download")
 data/                 Patient-level split + valid-patch manifest (generated)
 src/
   data.py             Dataset, dataloaders, patient-level split

@@ -20,10 +20,14 @@ Thumbs.db
 # IDE
 .vscode/
 
-# Archives
+# Raw dataset & archives — too large for git (~3.3 GB zip / ~4.2 GB extracted).
+# Downloaded from Kaggle via scripts/download_dataset.sh, never committed.
+# archive/README.md is force-added (git add -f) so the download instructions
+# stay tracked even though the folder itself is ignored.
 archive/
+.archive/
+.archive
 *.zip
-!archive.zip
 
 # Data (uncomment if your data shouldn't be tracked)
 # data/
