@@ -32,6 +32,7 @@ from torchvision import transforms
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ARCHIVE_DIR = os.path.join(PROJECT_ROOT, "archive")
 SPLITS_PATH = os.path.join(PROJECT_ROOT, "data", "splits.json")
+MANIFEST_PATH = os.path.join(PROJECT_ROOT, "data", "manifest.json")
 
 DUPLICATE_DIRNAME = "IDC_regular_ps50_idx5"  # nested full mirror — must be ignored
 PATCH_SIZE = (50, 50)
@@ -99,6 +100,60 @@ def list_patient_patches(
             if _patch_is_full_size(path):
                 patches.append((path, label))
     return patches
+
+
+# --- Valid-patch manifest cache --------------------------------------------
+# Opening 275k PNG headers to filter non-50x50 patches on every run is wasteful.
+# The manifest caches the valid (path, label) list per patient. Staleness is
+# checked cheaply by counting raw .png files (listdir only, no image opens).
+
+def _raw_png_count(archive_dir: str = ARCHIVE_DIR) -> int:
+    """Count .png files under numeric patient/class folders (no image opens)."""
+    total = 0
+    for pid in iter_patient_ids(archive_dir):  # bounded: one pass over patients
+        for label in CLASSES:
+            class_dir = os.path.join(archive_dir, pid, str(label))
+            if os.path.isdir(class_dir):
+                total += sum(1 for f in os.listdir(class_dir) if f.endswith(".png"))
+    return total
+
+
+def build_manifest(
+    archive_dir: str = ARCHIVE_DIR, manifest_path: str = MANIFEST_PATH
+) -> dict:
+    """Scan every numeric patient folder once, filter to 50x50, and cache the
+    valid (relpath, label) lists to ``manifest_path``."""
+    patients: dict[str, list] = {}
+    for pid in iter_patient_ids(archive_dir):  # bounded: one pass over patients
+        patches = list_patient_patches(pid, archive_dir)
+        patients[pid] = [
+            [os.path.relpath(path, archive_dir), label] for path, label in patches
+        ]
+    document = {
+        "raw_png_count": _raw_png_count(archive_dir),
+        "patch_size": list(PATCH_SIZE),
+        "patients": patients,
+    }
+    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(document, f)
+    return document
+
+
+def load_manifest(
+    archive_dir: str = ARCHIVE_DIR,
+    manifest_path: str = MANIFEST_PATH,
+    rebuild_if_stale: bool = True,
+) -> dict:
+    """Load the cached manifest, rebuilding it if absent or stale (raw .png
+    count no longer matches the archive)."""
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, encoding="utf-8") as f:
+            document = json.load(f)
+        fresh = document.get("raw_png_count") == _raw_png_count(archive_dir)
+        if fresh or not rebuild_if_stale:
+            return document
+    return build_manifest(archive_dir, manifest_path)
 
 
 # --- Split construction (quintile-stratified, patient-level) ----------------
@@ -319,14 +374,27 @@ class BreastHistopathologyDataset(Dataset):
         transform: Optional[Callable] = None,
         splits_path: str = SPLITS_PATH,
         archive_dir: str = ARCHIVE_DIR,
+        use_manifest: bool = True,
+        manifest_path: str = MANIFEST_PATH,
     ) -> None:
         assert split in SPLIT_NAMES, f"unknown split {split!r}"
         self.split = split
         self.transform = transform
         patient_ids = load_split_patient_ids(split, splits_path)
         self.samples: list[tuple[str, int]] = []
-        for pid in patient_ids:  # bounded by patients in this split
-            self.samples.extend(list_patient_patches(pid, archive_dir))
+        if use_manifest:
+            # Fast path: read cached valid-patch lists (built by globbing the
+            # numeric folders) instead of re-scanning 275k files every run.
+            patients = load_manifest(archive_dir, manifest_path)["patients"]
+            for pid in patient_ids:  # bounded by patients in this split
+                if pid not in patients:
+                    raise KeyError(f"patient {pid} missing from manifest")
+                for rel, label in patients[pid]:
+                    self.samples.append((os.path.join(archive_dir, rel), label))
+        else:
+            # Fallback: glob numeric top-level folders directly.
+            for pid in patient_ids:  # bounded by patients in this split
+                self.samples.extend(list_patient_patches(pid, archive_dir))
         assert self.samples, f"no samples found for split {split!r}"
 
     def __len__(self) -> int:
