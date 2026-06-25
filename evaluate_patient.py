@@ -1,26 +1,28 @@
+# NOTE ON IDC DATASET STRUCTURE
+# Every patient in this dataset is a breast cancer patient. Labels 0/1 are
+# patch-level region labels (does this 50x50 patch contain IDC?), not patient
+# diagnosis labels. Patient-level "recall" in the binary classification sense
+# is undefined here (no true negatives). The meaningful patient-level metric
+# is per-patient patch recall: for each patient, what fraction of their IDC-
+# positive patches does the model correctly identify?
 """Patient-level evaluation on the held-out TEST set (the headline metric).
 
-Per-patch accuracy is for debugging; what matters clinically is per-PATIENT
-performance — "would this tool have flagged this patient's slide?". This script
-rolls the per-patch malignant probabilities up to one decision per patient and
-reports recall / precision / F1 under two aggregation strategies.
+The clinically meaningful question for this dataset is NOT "is this patient
+malignant" (every patient is) but: *for each cancer patient, what fraction of
+their IDC-positive tissue regions does the model correctly flag?* — i.e.
+**per-patient patch recall**, with per-patient patch precision alongside it.
+We report the mean, std, and distribution (min/p25/median/p75/max) across
+patients.
 
-Ground truth: a patient is malignant iff they have >=1 label-1 (IDC) patch in the
-test set; benign iff all their patches are label 0.
-
-Strategy A (max probability): patient score = max patch P(malignant); flag if it
-meets the val-tuned threshold from config.py. The most clinically conservative
-rule — a single suspicious patch flags the patient.
-
-Strategy B (proportion): patient score = fraction of patches called malignant at
-0.50; flag if that fraction exceeds 0.10. A separate comparison, not a swap-in.
+This script also runs a VAL-only threshold search optimised for mean per-patient
+patch recall under a precision floor, then applies the chosen threshold to TEST
+exactly once.
 
 Correctness guarantees (see CLAUDE.md / BRAIN.md):
-  * TEST split only — val and train are never read for inference.
-  * Patient IDs are asserted disjoint across train/val/test before any inference;
-    overlap stops the run rather than being papered over.
-  * The decision threshold is taken unchanged from config.py — never retuned on
-    test data.
+  * Threshold search reads the VAL split only; TEST is touched once at the end.
+  * Patient IDs are asserted disjoint across train/val/test before any inference.
+  * Patient grouping comes from the ``archive/<pid>/<class>/`` folder structure,
+    never trusted from the filename regex (which is only cross-checked).
 
 Coding discipline follows the p10-coding-rules skill.
 
@@ -52,10 +54,15 @@ logger = logging.getLogger(__name__)
 
 EVAL_BATCH_SIZE = 512
 NUM_WORKERS = 6
-PROPORTION_FLAG = 0.10  # Strategy B: flag patient if >10% of patches called malignant
-PATCH_DECISION = 0.50   # Strategy B per-patch call threshold
-N_EXAMPLES = 5          # regex cross-check sample size
+N_EXAMPLES = 5                 # regex cross-check sample size
+PRECISION_FLOOR = 0.70        # patient-level threshold-search precision floor
+# Threshold sweep grid for the patient-level search: 0.05..0.95 step 0.01.
+THRESHOLD_GRID: tuple[float, ...] = tuple(round(0.05 + 0.01 * i, 2) for i in range(91))
+# Materiality cut-off for adopting a separate patient threshold (see Step 1).
+THRESHOLD_DELTA_CUTOFF = 0.05
 
+
+# --- Split + grouping -------------------------------------------------------
 
 def load_split_assignment(splits_path: str = SPLITS_PATH) -> dict[str, str]:
     """Load the persisted ``patient_id -> split`` map."""
@@ -67,11 +74,7 @@ def load_split_assignment(splits_path: str = SPLITS_PATH) -> dict[str, str]:
 
 
 def assert_no_split_overlap(assignment: dict[str, str]) -> None:
-    """Fail loudly if any patient appears in more than one split.
-
-    Patient leakage across splits is the single biggest source of fake accuracy
-    on this dataset, so this is a hard precondition, not a warning.
-    """
+    """Fail loudly if any patient appears in more than one split."""
     splits: dict[str, set[str]] = {"train": set(), "val": set(), "test": set()}
     for pid, split in assignment.items():  # bounded by patient count
         if split not in splits:
@@ -90,77 +93,128 @@ def patient_id_from_path(path: str) -> str:
     return Path(path).parent.parent.name
 
 
-def group_by_patient(
-    samples: list[tuple[str, int]], probabilities: np.ndarray
-) -> dict[str, dict]:
-    """Group per-patch (label, P(malignant)) by patient from the path structure.
+def collect_grouped(split: str, model, device) -> dict[str, dict]:
+    """Run inference on ``split`` and group (prob, label) per patient.
 
-    Returns ``pid -> {"truth": int, "probs": list[float]}`` where ``truth`` is 1
-    iff the patient has at least one malignant patch.
+    Returns ``pid -> {"probs": np.ndarray, "labels": np.ndarray}``. Uses the
+    shared dataloader with ``shuffle=False`` so ``collect_predictions`` output
+    aligns index-for-index with ``dataset.samples``.
     """
-    # Explicit raise (not assert): this length check is the alignment invariant
-    # that patch i's probability matches patch i's label. A silent mismatch would
-    # corrupt every patient metric, so the guard must survive `python -O`.
+    loader = build_dataloader(split, EVAL_BATCH_SIZE, CONFIG.image_size,
+                              NUM_WORKERS, shuffle=False)
+    samples: list[tuple[str, int]] = loader.dataset.samples
+    _, probabilities = collect_predictions(model, loader, device)
+    # Explicit raise (survives -O): this is the prob<->label alignment invariant.
     if len(samples) != len(probabilities):
         raise ValueError(
-            f"samples/probs length mismatch: {len(samples)} != {len(probabilities)}"
+            f"[{split}] samples/probs length mismatch: "
+            f"{len(samples)} != {len(probabilities)}"
         )
-    grouped: dict[str, dict] = {}
+    acc: dict[str, dict] = {}
     for (path, label), prob in zip(samples, probabilities):  # bounded by N patches
         pid = patient_id_from_path(path)
-        bucket = grouped.setdefault(pid, {"truth": 0, "probs": []})
+        bucket = acc.setdefault(pid, {"probs": [], "labels": []})
         bucket["probs"].append(float(prob))
-        if label == 1:
-            bucket["truth"] = 1
-    return grouped
+        bucket["labels"].append(int(label))
+    for bucket in acc.values():  # bounded by patient count
+        bucket["probs"] = np.asarray(bucket["probs"], dtype=np.float64)
+        bucket["labels"] = np.asarray(bucket["labels"], dtype=np.int64)
+    return acc
 
 
-def _binary_metrics(preds: dict[str, int], truth: dict[str, int]) -> dict:
-    """Recall / precision / F1 and class counts for a patient-level prediction map."""
-    tp = fp = fn = tn = 0
-    for pid, true_label in truth.items():  # bounded by patient count
-        pred = preds[pid]
-        if pred == 1 and true_label == 1:
-            tp += 1
-        elif pred == 1 and true_label == 0:
-            fp += 1
-        elif pred == 0 and true_label == 1:
-            fn += 1
-        else:
-            tn += 1
-    recall = tp / (tp + fn) if (tp + fn) else 0.0
-    precision = tp / (tp + fp) if (tp + fp) else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-    return {"recall": recall, "precision": precision, "f1": f1,
-            "tp": tp, "fp": fp, "fn": fn, "tn": tn}
+# --- Per-patient patch recall / precision -----------------------------------
+
+def per_patient_recall_precision(
+    grouped: dict[str, dict], threshold: float
+) -> tuple[list[float], list[float]]:
+    """Per-patient patch recall and precision at ``threshold``.
+
+    For each patient: recall = TP / (#malignant patches), precision =
+    TP / (#patches called malignant). A patient's recall is undefined (and
+    omitted) if they have no malignant patch; precision is undefined (and
+    omitted) if the model calls none of their patches malignant.
+
+    Note: because undefined values are omitted, mean recall and mean precision
+    can be averaged over different patient subsets at high thresholds (where some
+    patients get zero positive calls). At the operating thresholds used here all
+    patients have both defined, so the two means cover the same 45 patients.
+    """
+    recalls: list[float] = []
+    precisions: list[float] = []
+    for bucket in grouped.values():  # bounded by patient count
+        labels = bucket["labels"]
+        predicted = bucket["probs"] >= threshold
+        true_pos = int(np.sum(predicted & (labels == 1)))
+        n_malignant = int(np.sum(labels == 1))
+        n_called = int(np.sum(predicted))
+        if n_malignant > 0:
+            recalls.append(true_pos / n_malignant)
+        if n_called > 0:
+            precisions.append(true_pos / n_called)
+    return recalls, precisions
 
 
-def strategy_a_predictions(grouped: dict[str, dict], threshold: float) -> dict[str, int]:
-    """Max-probability rule: flag patient if their highest patch prob >= threshold."""
+def distribution(values: list[float]) -> dict[str, float]:
+    """Mean/std and the min/p25/median/p75/max distribution of ``values``."""
+    if not values:
+        raise ValueError("cannot summarise an empty distribution")
+    arr = np.asarray(values, dtype=np.float64)
     return {
-        pid: int(max(bucket["probs"]) >= threshold)
-        for pid, bucket in grouped.items()  # bounded by patient count
+        "mean": float(arr.mean()), "std": float(arr.std()),
+        "min": float(arr.min()), "p25": float(np.percentile(arr, 25)),
+        "median": float(np.median(arr)), "p75": float(np.percentile(arr, 75)),
+        "max": float(arr.max()), "n": int(arr.size),
     }
 
 
-def strategy_b_predictions(grouped: dict[str, dict]) -> dict[str, int]:
-    """Proportion rule: flag patient if >10% of patches are malignant at 0.50."""
-    predictions: dict[str, int] = {}
-    for pid, bucket in grouped.items():  # bounded by patient count
-        probs = np.asarray(bucket["probs"])
-        fraction = float((probs >= PATCH_DECISION).mean())
-        predictions[pid] = int(fraction > PROPORTION_FLAG)
-    return predictions
+def _mean_patient_rp(grouped: dict[str, dict], threshold: float) -> tuple[float, float]:
+    """Mean per-patient patch recall and precision at ``threshold``."""
+    recalls, precisions = per_patient_recall_precision(grouped, threshold)
+    mean_recall = float(np.mean(recalls)) if recalls else 0.0
+    mean_precision = float(np.mean(precisions)) if precisions else 0.0
+    return mean_recall, mean_precision
 
+
+# --- VAL-only threshold search (Step 1) -------------------------------------
+
+def search_patient_threshold(
+    val_patch_probs: dict[str, list[float]],
+    val_patch_labels: dict[str, list[int]],
+    precision_floor: float = PRECISION_FLOOR,
+) -> float:
+    """Threshold maximising mean per-patient patch recall on val.
+
+    Sweeps :data:`THRESHOLD_GRID`; among thresholds whose mean per-patient patch
+    precision is at least ``precision_floor``, returns the one with the highest
+    mean per-patient patch recall. If none meet the floor, falls back to the
+    highest-precision threshold (and warns). VAL ONLY — never call with test.
+    """
+    if not val_patch_probs:
+        raise ValueError("empty val_patch_probs")
+    grouped = {
+        pid: {"probs": np.asarray(val_patch_probs[pid], dtype=np.float64),
+              "labels": np.asarray(val_patch_labels[pid], dtype=np.int64)}
+        for pid in val_patch_probs  # bounded by patient count
+    }
+    best_t, best_recall = None, -1.0
+    fallback_t, fallback_prec = THRESHOLD_GRID[0], -1.0
+    for threshold in THRESHOLD_GRID:  # bounded: 91 candidates
+        mean_recall, mean_precision = _mean_patient_rp(grouped, threshold)
+        if mean_precision >= precision_floor and mean_recall > best_recall:
+            best_recall, best_t = mean_recall, threshold
+        if mean_precision > fallback_prec:
+            fallback_prec, fallback_t = mean_precision, threshold
+    if best_t is None:
+        logger.warning("no threshold met precision floor %.2f on val; falling back "
+                       "to highest-precision t=%.2f", precision_floor, fallback_t)
+        return float(fallback_t)
+    return float(best_t)
+
+
+# --- Cross-checks -----------------------------------------------------------
 
 def regex_crosscheck(samples: list[tuple[str, int]]) -> list[str]:
-    """Confirm the config patient-ID regex agrees with the folder-derived ID.
-
-    Samples ``N_EXAMPLES`` patches evenly spaced across the dataset (so the
-    examples span different patients, not one patient's contiguous block) and
-    verifies the regex-parsed ID matches the archive folder structure. Raises on
-    any disagreement.
-    """
+    """Confirm the config patient-ID regex agrees with the folder-derived ID."""
     if not samples:
         raise ValueError("no samples to cross-check")
     step = max(1, len(samples) // N_EXAMPLES)
@@ -182,73 +236,108 @@ def regex_crosscheck(samples: list[tuple[str, int]]) -> list[str]:
 
 
 def count_zero_patch_patients(
-    assignment: dict[str, str], grouped: dict[str, dict]
+    assignment: dict[str, str], grouped: dict[str, dict], split: str
 ) -> int:
-    """How many TEST patients have no usable patches after the 50x50 filter."""
-    test_ids = {pid for pid, split in assignment.items() if split == "test"}
-    return sum(1 for pid in test_ids if pid not in grouped)  # bounded by patients
+    """How many ``split`` patients have no usable patches after the 50x50 filter."""
+    ids = {pid for pid, s in assignment.items() if s == split}
+    return sum(1 for pid in ids if pid not in grouped)  # bounded by patients
 
 
-def _report(grouped: dict[str, dict], examples: list[str], zero_patch: int) -> None:
-    """Print the required patient-level evaluation report."""
-    truth = {pid: bucket["truth"] for pid, bucket in grouped.items()}
-    total = len(truth)
-    malignant = sum(truth.values())
-    benign = total - malignant
+# --- Reporting --------------------------------------------------------------
 
-    threshold = CONFIG.default_threshold
-    metrics_a = _binary_metrics(strategy_a_predictions(grouped, threshold), truth)
-    metrics_b = _binary_metrics(strategy_b_predictions(grouped), truth)
+def _fmt_dist(label: str, dist: dict[str, float]) -> str:
+    """One-line distribution summary."""
+    return (f"  {label:<10} mean={dist['mean']:.3f} (std={dist['std']:.3f}) | "
+            f"min={dist['min']:.3f} p25={dist['p25']:.3f} median={dist['median']:.3f} "
+            f"p75={dist['p75']:.3f} max={dist['max']:.3f}  [n={dist['n']}]")
 
-    print("\n=== Patient-Level Evaluation (Test Set) ===")
-    print(f"Total patients: {total}  |  Malignant: {malignant}  |  Benign: {benign}")
-    print(f"\nStrategy A (max probability, threshold={threshold:.4f}):")
-    print(f"  Patient Recall: {metrics_a['recall']:.3f}  "
-          f"Precision: {metrics_a['precision']:.3f}  F1: {metrics_a['f1']:.3f}  "
-          f"[tp={metrics_a['tp']} fp={metrics_a['fp']} fn={metrics_a['fn']} "
-          f"tn={metrics_a['tn']}]")
-    print(f"\nStrategy B (malignant patch proportion > {PROPORTION_FLAG:.2f}):")
-    print(f"  Patient Recall: {metrics_b['recall']:.3f}  "
-          f"Precision: {metrics_b['precision']:.3f}  F1: {metrics_b['f1']:.3f}  "
-          f"[tp={metrics_b['tp']} fp={metrics_b['fp']} fn={metrics_b['fn']} "
-          f"tn={metrics_b['tn']}]")
-    print(f"\n{N_EXAMPLES} example patient IDs (confirm regex is working): {examples}")
-    print(f"Zero-patch test patients (should be 0): {zero_patch}")
 
-    if benign == 0:
-        # Honesty guard: with no benign patients, precision/specificity are
-        # vacuously 1.0 and carry no information. Recall is the only meaningful
-        # patient-level number here. This is expected for IDC whole-slide data —
-        # every patient has at least one cancerous region — and must be reported
-        # as such, never as a genuine perfect-precision result.
-        print("\n[!] DEGENERATE PATIENT LABELS: every test patient has >=1 "
-              "malignant patch, so there are 0 benign patients. Patient-level "
-              "PRECISION/SPECIFICITY are uninformative; only RECALL is meaningful.")
+def report_per_patient(grouped: dict[str, dict], threshold: float, tag: str) -> None:
+    """Print the per-patient patch recall/precision distributions for one split."""
+    recalls, precisions = per_patient_recall_precision(grouped, threshold)
+    print(f"\n-- Per-patient patch recall/precision ({tag}, threshold={threshold:.4f}) --")
+    print(_fmt_dist("recall", distribution(recalls)))
+    if precisions:
+        print(_fmt_dist("precision", distribution(precisions)))
+    else:
+        print("  precision  undefined (model called no patch malignant for any patient)")
+
+
+def report_vacuous_binary(grouped: dict[str, dict]) -> None:
+    """Print the old binary patient classification, clearly labelled vacuous."""
+    truths = [int(np.any(b["labels"] == 1)) for b in grouped.values()]
+    total = len(truths)
+    malignant = int(sum(truths))
+    print("\n-- Binary patient classification: VACUOUS — no benign patients --")
+    print(f"  {malignant}/{total} patients are malignant, {total - malignant} benign. "
+          "With no true negatives, patient-level recall/precision/F1 are trivially "
+          "1.0 and carry NO information. Use per-patient patch recall above instead.")
+
+
+# --- Main -------------------------------------------------------------------
+
+def _run_threshold_search(val_grouped: dict, test_grouped: dict) -> None:
+    """Step 1: VAL-only threshold search, then report val/test operating points."""
+    patch_threshold = CONFIG.default_threshold  # existing patch-level threshold
+    val_probs = {pid: b["probs"].tolist() for pid, b in val_grouped.items()}
+    val_labels = {pid: b["labels"].tolist() for pid, b in val_grouped.items()}
+    t_star = search_patient_threshold(val_probs, val_labels, PRECISION_FLOOR)
+
+    val_r_star, val_p_star = _mean_patient_rp(val_grouped, t_star)
+    val_r_old, val_p_old = _mean_patient_rp(val_grouped, patch_threshold)
+    test_r_star, test_p_star = _mean_patient_rp(test_grouped, t_star)
+    delta = abs(t_star - patch_threshold)
+
+    print("\n=== Patient-Level Threshold Search (VAL only) ===")
+    print(f"Patient-optimized threshold t* = {t_star:.2f} "
+          f"(precision floor {PRECISION_FLOOR:.2f})")
+    print(f"VAL  @ t*={t_star:.2f}      : mean recall={val_r_star:.3f}  "
+          f"mean precision={val_p_star:.3f}")
+    print(f"VAL  @ patch={patch_threshold:.4f} : mean recall={val_r_old:.3f}  "
+          f"mean precision={val_p_old:.3f}")
+    print(f"TEST @ t*={t_star:.2f}      : mean recall={test_r_star:.3f}  "
+          f"mean precision={test_p_star:.3f}  (applied once, no further tuning)")
+    if delta > THRESHOLD_DELTA_CUTOFF:
+        print(f"Decision: |t* - patch| = {delta:.3f} > {THRESHOLD_DELTA_CUTOFF} -> "
+              "adopt a separate PATIENT_THRESHOLD in config.py.")
+    else:
+        print(f"Decision: |t* - patch| = {delta:.3f} <= {THRESHOLD_DELTA_CUTOFF} -> "
+              "no patient-level retuning needed; keep the single threshold.")
 
 
 def main() -> None:
-    """Run the full patient-level evaluation on the held-out test set."""
+    """Run the corrected patient-level evaluation and threshold search."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     assignment = load_split_assignment()
     assert_no_split_overlap(assignment)
     print("Patient ID split overlap: NONE CONFIRMED")
 
     device = get_device()
-    model = load_model(CONFIG.active_model, CONFIG.active_spec.checkpoint, device)
+    model = load_model(CONFIG.active_model, CONFIG.active_checkpoint, device)
 
-    # TEST split only — val/train are never loaded here.
-    # shuffle=False is REQUIRED here: collect_predictions returns probabilities in
-    # loader iteration order, which equals dataset index order only without
-    # shuffling. That ordering is what aligns probabilities[i] with samples[i].
-    loader = build_dataloader("test", EVAL_BATCH_SIZE, CONFIG.image_size,
-                              NUM_WORKERS, shuffle=False)
-    samples: list[tuple[str, int]] = loader.dataset.samples  # index order preserved
-    _, probabilities = collect_predictions(model, loader, device)
+    # VAL is used only for the threshold search; TEST is the held-out report.
+    val_grouped = collect_grouped("val", model, device)
+    test_grouped = collect_grouped("test", model, device)
 
-    grouped = group_by_patient(samples, probabilities)
-    examples = regex_crosscheck(samples)
-    zero_patch = count_zero_patch_patients(assignment, grouped)
-    _report(grouped, examples, zero_patch)
+    patch_threshold = CONFIG.default_threshold
+    print("\n=== Patient-Level Evaluation (Test Set) ===")
+    print("Headline metric = per-patient patch recall (see NOTE at top of file).")
+    # Report at both operating points: the patch threshold (single-patch view) and
+    # the deployed patient threshold (per-patient/batch view, what the app uses).
+    report_per_patient(test_grouped, patch_threshold, "TEST @ patch threshold")
+    report_per_patient(test_grouped, CONFIG.patient_threshold,
+                       "TEST @ patient threshold")
+
+    test_loader_samples_pid = regex_crosscheck(
+        build_dataloader("test", EVAL_BATCH_SIZE, CONFIG.image_size,
+                         NUM_WORKERS, shuffle=False).dataset.samples
+    )
+    zero_patch = count_zero_patch_patients(assignment, test_grouped, "test")
+    print(f"\n{N_EXAMPLES} example patient IDs (confirm regex): {test_loader_samples_pid}")
+    print(f"Zero-patch test patients (should be 0): {zero_patch}")
+
+    report_vacuous_binary(test_grouped)
+    _run_threshold_search(val_grouped, test_grouped)
 
 
 if __name__ == "__main__":

@@ -77,20 +77,23 @@ class AppRuntime:
 
     def __init__(self) -> None:
         self.device = _select_device()
-        spec = CONFIG.active_spec
-        self.model = load_model(CONFIG.active_model, spec.checkpoint, self.device)
+        self.model = load_model(CONFIG.active_model, CONFIG.active_checkpoint,
+                                self.device)
         target_layer = get_target_layer(self.model, CONFIG.active_model)
         self.gradcam = GradCAM(self.model, target_layer)
-        self.threshold = CONFIG.default_threshold
-        logger.info("runtime ready: model=%s device=%s threshold=%.4f",
-                    CONFIG.active_model, self.device, self.threshold)
+        # Two operating points: single-patch view vs per-patient (batch) view.
+        self.patch_threshold = CONFIG.patch_threshold
+        self.patient_threshold = CONFIG.patient_threshold
+        logger.info("runtime ready: model=%s device=%s patch_t=%.4f patient_t=%.4f",
+                    CONFIG.active_model, self.device,
+                    self.patch_threshold, self.patient_threshold)
 
     def classify_single(self, image_path: str | None):
         """Adapter for Tab 1: path -> (label+confidence markdown, overlay image)."""
         if not image_path:
             return "Upload a patch image to classify.", None
         result = predict_single(Path(image_path), self.model, self.gradcam,
-                                self.threshold)
+                                self.patch_threshold)  # single-patch operating point
         summary = (
             f"**Prediction: {result['label']}**  \n"
             f"P(malignant) = {result['probability']:.3f} "
@@ -103,7 +106,8 @@ class AppRuntime:
         paths = _image_paths(files)
         if not paths:
             return [], []
-        predictions = predict_batch(paths, self.model, self.threshold)
+        # Per-patient view: use the patient-level operating point.
+        predictions = predict_batch(paths, self.model, self.patient_threshold)
         patch_rows = [
             [p["path"].name, p["label"], f"{p['probability']:.3f}"]
             for p in predictions  # bounded by number of uploaded files

@@ -52,9 +52,16 @@ class ModelSpec:
         arch: Key passed to ``src/models.build_model`` ("resnet18"/"smallcnn").
         checkpoint: Path to the best-checkpoint ``.pt`` file.
         image_size: Square input size the model was trained at.
-        tuned_threshold: Malignant decision threshold tuned on the VALIDATION
-            split under a precision floor (Phase 5), applied unchanged at
-            inference. Never re-tuned on test data.
+        patch_threshold: Single-PATCH decision threshold, tuned on VAL for
+            patch-level recall under a precision floor (Phase 5). Used for the
+            single-patch view. Never re-tuned on test data.
+        patient_threshold: Decision threshold for the per-PATIENT (batch) view,
+            tuned separately on VAL to maximise mean per-patient *patch* recall
+            under a precision floor (Phase 7 / evaluate_patient.py). The two
+            questions differ — "is this one patch malignant" vs "how much of this
+            patient's IDC tissue did we catch" — so they get separate operating
+            points. When the patient search yields the same value (within 0.05 of
+            patch_threshold) the two are simply set equal.
         target_layer: Dotted module path (resolved against the model) of the
             convolutional layer used as the Grad-CAM target.
     """
@@ -62,25 +69,35 @@ class ModelSpec:
     arch: str
     checkpoint: Path
     image_size: int
-    tuned_threshold: float
+    patch_threshold: float
+    patient_threshold: float
     target_layer: str
 
 
 # Registry of supported architectures. New architectures are registered here and
 # in src/models.build_model; nothing else in the app needs to change.
+# Threshold design decision (Phase 7): the single-patch and per-patient views are
+# answering different clinical questions, so each gets its own VAL-tuned operating
+# point. For ResNet18 the patient-level search (max mean per-patient patch recall,
+# precision floor 0.70) chose t*=0.26 vs the patch-level 0.3162 — a material gap
+# (|Δ|=0.056 > 0.05), so they are kept separate. SmallCNN was not searched at the
+# patient level (it is not the active model); its patient_threshold mirrors its
+# patch_threshold.
 MODEL_SPECS: dict[str, ModelSpec] = {
     "ResNet18": ModelSpec(
         arch="resnet18",
         checkpoint=CHECKPOINTS_DIR / "resnet18_best.pt",
         image_size=128,
-        tuned_threshold=0.3162,  # val-tuned, precision floor 0.70 (Phase 5)
-        target_layer="layer4.1",  # == layer4[-1], last BasicBlock
+        patch_threshold=0.3162,    # val-tuned patch recall, precision floor 0.70
+        patient_threshold=0.26,    # val-tuned per-patient patch recall (Phase 7)
+        target_layer="layer4.1",   # == layer4[-1], last BasicBlock
     ),
     "SmallCNN": ModelSpec(
         arch="smallcnn",
         checkpoint=CHECKPOINTS_DIR / "smallcnn_best.pt",
         image_size=50,
-        tuned_threshold=0.4192,  # val-tuned, precision floor 0.70 (Phase 5)
+        patch_threshold=0.4192,    # val-tuned, precision floor 0.70 (Phase 5)
+        patient_threshold=0.4192,  # not separately searched (inactive model)
         target_layer="features.12",  # last conv layer before global pool
     ),
 }
@@ -136,16 +153,28 @@ class Config:
     gradio_server_name: str
     gradio_server_port: int
     gradio_share: bool
-    # Derived: the active architecture's loadable spec and operating point.
+    # Derived: the active architecture's loadable spec and operating points.
     active_spec: ModelSpec = field(init=False)
-    default_threshold: float = field(init=False)
+    active_checkpoint: Path = field(init=False)    # honours HF_CHECKPOINT_PATH
+    patch_threshold: float = field(init=False)     # single-patch view
+    patient_threshold: float = field(init=False)   # per-patient (batch) view
+    default_threshold: float = field(init=False)   # alias of patch_threshold
     image_size: int = field(init=False)
 
     def __post_init__(self) -> None:
         # Frozen dataclass: set derived fields via object.__setattr__.
         spec = self.model_specs[self.active_model]
         object.__setattr__(self, "active_spec", spec)
-        object.__setattr__(self, "default_threshold", spec.tuned_threshold)
+        # Checkpoint resolution: on HuggingFace Spaces the weights live at a
+        # different path (bundled or downloaded), so HF_CHECKPOINT_PATH overrides
+        # the local default. Everything else reads CONFIG.active_checkpoint.
+        override = os.environ.get("HF_CHECKPOINT_PATH")
+        object.__setattr__(self, "active_checkpoint",
+                           Path(override) if override else spec.checkpoint)
+        object.__setattr__(self, "patch_threshold", spec.patch_threshold)
+        object.__setattr__(self, "patient_threshold", spec.patient_threshold)
+        # default_threshold kept as a back-compat alias of the patch threshold.
+        object.__setattr__(self, "default_threshold", spec.patch_threshold)
         object.__setattr__(self, "image_size", spec.image_size)
 
 
