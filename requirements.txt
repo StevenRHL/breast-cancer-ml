@@ -2,9 +2,13 @@
 # Pinned to versions verified working with torch.backends.mps.is_available() == True.
 torch==2.12.1
 torchvision==0.27.1
-pillow==12.0.0
 numpy==2.3.5
 scikit-learn==1.9.0
-matplotlib==3.11.0
-# Phase 6 (interactive app) — add when reached:
-# gradio
+matplotlib==3.11.0          # Grad-CAM colormap (app/gradcam.py)
+
+# Phase 6 (interactive app).
+# gradio 4.x requires pillow<11, so Pillow is pinned to 10.4.x (was 12.0.0).
+pillow==10.4.0
+gradio>=4.0,<5.0
+# gradio 4.44.x imports HfFolder, removed in huggingface_hub 1.0 — pin below 1.0.
+huggingface_hub>=0.24,<1.0
