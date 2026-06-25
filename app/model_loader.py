@@ -21,6 +21,19 @@ from .config import CONFIG
 logger = logging.getLogger(__name__)
 
 
+def select_device() -> torch.device:
+    """Return MPS when available, else CPU.
+
+    Single source of truth for device selection, shared by the app runtime and
+    the whole-slide pipeline so they can never pick different backends. CPU is a
+    correct (if slower) fallback for any op MPS lacks — callers should also set
+    ``PYTORCH_ENABLE_MPS_FALLBACK=1`` for ops that fall back at runtime.
+    """
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def _build_bare_model(arch: str) -> nn.Module:
     """Construct an un-trained model for ``arch`` using the shared src factory.
 

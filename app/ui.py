@@ -14,16 +14,18 @@ Coding discipline follows the p10-coding-rules skill.
 from __future__ import annotations
 
 import logging
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
-import torch
+from src.wsi_inference import Analysis, analyse, build_patient_heatmap, write_report
 
 from .aggregator import aggregate_by_patient
 from .config import CONFIG
 from .disclaimer import render_disclaimer
 from .gradcam import GradCAM
 from .inference import predict_batch, predict_single
-from .model_loader import get_target_layer, load_model
+from .model_loader import get_target_layer, load_model, select_device
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,17 @@ _HEATMAP_RESOLUTION_NOTE: str = (
 _FILENAME_NOTE: str = (
     "**Keep original filenames** (e.g. `10253_idx5_x1001_y1001_class0.png`). "
     "Patient IDs are parsed from the filename to build the per-patient summary."
+)
+_WSI_NOTE: str = (
+    "Enter a **folder path** on this machine: a single patient folder "
+    "(`archive/10253`), a multi-patient root (`archive/`), or a flat folder of "
+    "`.png` patches. The whole-slide pipeline scores every patch, rolls results "
+    "up per patient, and writes a downloadable CSV. When ground-truth `class0/"
+    "class1` labels are present, per-patient **patch recall** is reported."
+)
+_WSI_HEATMAP_NOTE: str = (
+    "_Heatmap places each 50×50 patch's P(malignant) at its slide (x, y) tile. "
+    "It is a coarse 50px-resolution coverage map — not a precise lesion boundary._"
 )
 
 
@@ -65,18 +78,11 @@ def _patch_gradio_client_bool_schema() -> None:
     gc_utils._bool_schema_patched = True
 
 
-def _select_device() -> torch.device:
-    """MPS when available, else CPU (mirrors training; CPU fallback is fine)."""
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
 class AppRuntime:
     """Holds the loaded model and Grad-CAM so they are built once, not per call."""
 
     def __init__(self) -> None:
-        self.device = _select_device()
+        self.device = select_device()
         self.model = load_model(CONFIG.active_model, CONFIG.active_checkpoint,
                                 self.device)
         target_layer = get_target_layer(self.model, CONFIG.active_model)
@@ -120,6 +126,40 @@ class AppRuntime:
         ]
         return patch_rows, patient_rows
 
+    def analyse_folder(
+        self, folder_path: str | None, progress: Callable | None = None,
+    ) -> tuple[str, list[list], str | None, object | None]:
+        """Adapter for the WSI tab: a folder path -> (summary, rows, CSV, heatmap).
+
+        Reuses the already-loaded model (no reload). Errors are returned as a
+        user-facing message rather than raised, so a bad path never 500s the UI.
+        """
+        if not folder_path or not folder_path.strip():
+            return "Enter a patient folder path to analyse.", [], None, None
+        input_dir = Path(folder_path.strip()).expanduser()
+        if not input_dir.is_dir():
+            return f"Not a directory: `{input_dir}`", [], None, None
+        if progress is not None:
+            progress(0.1, desc="Discovering & scoring patches…")
+        try:
+            result = analyse(input_dir, threshold=self.patient_threshold,
+                             model_name=CONFIG.active_model, model=self.model)
+        except (ValueError, NotADirectoryError) as exc:
+            logger.warning("WSI analyse failed for %s: %s", input_dir, exc)
+            return f"Could not analyse folder: {exc}", [], None, None
+        if progress is not None:
+            progress(0.8, desc="Writing report…")
+        out_dir = Path(tempfile.mkdtemp(prefix="wsi_"))
+        meta = write_report(result, input_dir, out_dir)
+        if progress is not None:
+            progress(1.0, desc="Done")
+        return (
+            _format_wsi_summary(meta),
+            _wsi_patient_rows(result),
+            meta["patient_summary_csv"],
+            _dominant_heatmap(result),
+        )
+
 
 def _image_paths(files: list[str] | None) -> list[Path]:
     """Filter uploaded file paths down to supported image files."""
@@ -129,6 +169,38 @@ def _image_paths(files: list[str] | None) -> list[Path]:
         Path(f) for f in files  # bounded by number of uploaded files
         if Path(f).suffix.lower() in _IMAGE_SUFFIXES
     ]
+
+
+def _format_wsi_summary(meta: dict) -> str:
+    """Render the WSI run metadata (counts + recall distribution) as Markdown."""
+    dist = meta["per_patient_patch_recall"]
+    header = (f"**{meta['total_patients']} patient(s), {meta['total_patches']} "
+              f"patches** · threshold {meta['threshold']} · {meta['model']}")
+    if dist is None:
+        return (header + "  \n_Per-patient patch recall: N/A — no ground-truth "
+                "`class0/class1` labels in this folder._")
+    return (header + "  \n**Per-patient patch recall** (ground truth present): "
+            f"mean **{dist['mean']:.3f}** (std {dist['std']:.3f}) · "
+            f"median {dist['median']:.3f} · min {dist['min']:.3f} · "
+            f"max {dist['max']:.3f} · [n={dist['n']}]")
+
+
+def _wsi_patient_rows(analysis: Analysis) -> list[list]:
+    """Per-patient rows for the WSI table (recall blank when undefined)."""
+    return [
+        [s.patient_id, s.total_patches, s.malignant_count,
+         f"{s.malignant_pct:.1f}%",
+         "" if s.patch_recall is None else f"{s.patch_recall:.3f}"]
+        for s in analysis.summaries  # bounded by number of patients
+    ]
+
+
+def _dominant_heatmap(analysis: Analysis) -> object | None:
+    """Stitch the heatmap for the patient with the most patches (or None)."""
+    if not analysis.summaries:
+        return None
+    dominant = max(analysis.summaries, key=lambda s: s.total_patches)
+    return build_patient_heatmap(analysis.refs, analysis.probs, dominant.patient_id)
 
 
 def build_app():
@@ -175,6 +247,33 @@ def build_app():
             gr.Button("Score folder").click(
                 runtime.classify_folder, inputs=batch_in,
                 outputs=[patch_table, patient_table],
+            )
+
+        with gr.Tab("Whole-slide / folder"):
+            render_disclaimer()  # non-negotiable: disclaimer on every tab
+            gr.Markdown(_WSI_NOTE)
+            wsi_in = gr.Textbox(label="Patient folder path",
+                                placeholder="e.g. archive/10253")
+            wsi_summary = gr.Markdown()
+            wsi_table = gr.Dataframe(
+                headers=["patient_id", "patches", "malignant", "% suspicious",
+                         "patch recall"],
+                label="Per-patient summary",
+            )
+            with gr.Row():
+                wsi_heatmap = gr.Image(label="Slide malignancy heatmap "
+                                             "(largest patient)")
+                wsi_csv = gr.File(label="Download per-patient CSV")
+            gr.Markdown(_WSI_HEATMAP_NOTE)
+
+            def _run_wsi(folder_path, progress=gr.Progress()):  # noqa: B008,ANN001
+                # gr.Progress is injected by Gradio at call time; pass it through
+                # to the gradio-free runtime handler as a plain callable.
+                return runtime.analyse_folder(folder_path, progress)
+
+            gr.Button("Analyse folder").click(
+                _run_wsi, inputs=wsi_in,
+                outputs=[wsi_summary, wsi_table, wsi_csv, wsi_heatmap],
             )
 
     return app
