@@ -30,6 +30,40 @@ logger = logging.getLogger(__name__)
 # Image extensions accepted in batch mode.
 _IMAGE_SUFFIXES: frozenset[str] = frozenset({".png", ".jpg", ".jpeg"})
 
+# Rendered UI copy (kept as constants so it is testable and easy to audit).
+_HEATMAP_RESOLUTION_NOTE: str = (
+    "_Heatmap is upsampled from a 4×4 feature map. Localization is approximate._"
+)
+_FILENAME_NOTE: str = (
+    "**Keep original filenames** (e.g. `10253_idx5_x1001_y1001_class0.png`). "
+    "Patient IDs are parsed from the filename to build the per-patient summary."
+)
+
+
+def _patch_gradio_client_bool_schema() -> None:
+    """Work around a gradio_client 1.3.0 / gradio 4.44 api-info crash.
+
+    ``_json_schema_to_python_type`` recurses into boolean JSON-schema values
+    (e.g. ``additionalProperties: true``) and then does ``"const" in schema`` on
+    a ``bool``, raising ``TypeError: argument of type 'bool' is not iterable``.
+    That 500s the startup healthcheck, which in turn makes ``launch`` believe
+    localhost is unreachable. We short-circuit boolean schemas to ``Any``.
+    Idempotent: only patches once.
+    """
+    from gradio_client import utils as gc_utils
+
+    if getattr(gc_utils, "_bool_schema_patched", False):
+        return
+    original = gc_utils._json_schema_to_python_type
+
+    def safe(schema, defs=None):  # noqa: ANN001 (mirrors patched signature)
+        if isinstance(schema, bool):
+            return "Any"
+        return original(schema, defs)
+
+    gc_utils._json_schema_to_python_type = safe
+    gc_utils._bool_schema_patched = True
+
 
 def _select_device() -> torch.device:
     """MPS when available, else CPU (mirrors training; CPU fallback is fine)."""
@@ -97,6 +131,7 @@ def build_app():
     """Assemble and return the Gradio ``Blocks`` app."""
     import gradio as gr  # lazy: keep Gradio out of non-UI import paths
 
+    _patch_gradio_client_bool_schema()  # gradio 4.44 api-info compatibility
     runtime = AppRuntime()
     title = f"Breast IDC Classifier — {CONFIG.active_model}"
     with gr.Blocks(title=title) as app:
@@ -109,6 +144,10 @@ def build_app():
                 with gr.Column():
                     single_out = gr.Markdown()
                     overlay_out = gr.Image(label="Grad-CAM overlay")
+                    # Rendered resolution caveat directly under the overlay (not
+                    # only in the bottom disclaimer): ResNet18 layer4 maps are 4×4
+                    # at 128×128 input, bilinearly upsampled for display.
+                    gr.Markdown(_HEATMAP_RESOLUTION_NOTE)
             gr.Button("Classify").click(
                 runtime.classify_single, inputs=single_in,
                 outputs=[single_out, overlay_out],
@@ -116,7 +155,11 @@ def build_app():
 
         with gr.Tab("Batch / folder"):
             render_disclaimer()  # non-negotiable: disclaimer on every tab
-            batch_in = gr.File(file_count="multiple", label="Patch images")
+            gr.Markdown(_FILENAME_NOTE)
+            # type="filepath": Gradio writes uploads to a temp dir but preserves
+            # the original basename, which is what the patient-ID regex parses.
+            batch_in = gr.File(file_count="multiple", type="filepath",
+                               label="Patch images")
             patch_table = gr.Dataframe(
                 headers=["file", "prediction", "P(malignant)"],
                 label="Per-patch results",
@@ -140,6 +183,7 @@ def main() -> None:
         server_name=CONFIG.gradio_server_name,
         server_port=CONFIG.gradio_server_port,
         share=CONFIG.gradio_share,
+        show_api=False,  # we expose no programmatic API; avoids api-info schema walk
     )
 
 

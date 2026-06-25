@@ -12,3 +12,8 @@ pillow==10.4.0
 gradio>=4.0,<5.0
 # gradio 4.44.x imports HfFolder, removed in huggingface_hub 1.0 — pin below 1.0.
 huggingface_hub>=0.24,<1.0
+# gradio 4.44.1 doesn't cap fastapi/starlette; the resolver otherwise pulls
+# fastapi 0.138/starlette 1.x, whose TemplateResponse signature change breaks
+# gradio's page render (Jinja2 "unhashable type: dict"). Pin a contemporary set.
+fastapi==0.112.4
+starlette==0.38.6

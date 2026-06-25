@@ -76,6 +76,13 @@ def aggregate_by_patient(
         total = bucket["total_patches"]
         bucket["malignant_pct"] = 100.0 * bucket["malignant_count"] / total
 
-    logger.info("aggregated %d patches into %d patients (%d unmatched)",
-                len(predictions), len(summary), len(predictions) - matched)
+    unmatched = len(predictions) - matched
+    if unmatched:
+        # Partial drop is visible, not buried: unmatched patches are excluded
+        # from every per-patient total, which under-counts malignant burden.
+        logger.warning("%d of %d patches had unparseable patient IDs and were "
+                       "excluded from the per-patient summary",
+                       unmatched, len(predictions))
+    logger.info("aggregated %d patches into %d patients",
+                len(predictions), len(summary))
     return summary
