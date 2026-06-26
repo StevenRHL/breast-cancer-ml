@@ -78,18 +78,19 @@ class ModelSpec:
 # in src/models.build_model; nothing else in the app needs to change.
 # Threshold design decision (Phase 7): the single-patch and per-patient views are
 # answering different clinical questions, so each gets its own VAL-tuned operating
-# point. For ResNet18 the patient-level search (max mean per-patient patch recall,
-# precision floor 0.70) chose t*=0.26 vs the patch-level 0.3162 — a material gap
-# (|Δ|=0.056 > 0.05), so they are kept separate. SmallCNN was not searched at the
-# patient level (it is not the active model); its patient_threshold mirrors its
-# patch_threshold.
+# point. For the retrained ResNet18 (AdamW + cosine LR, lr=2e-4) the patient-level
+# search (max mean per-patient patch recall, precision floor 0.70) chose t*=0.35 vs
+# the patch-level 0.3845 — within tolerance (|Δ|=0.034 <= 0.05), so the two views
+# now collapse to a single threshold. (The earlier 3-epoch model split them
+# 0.3162/0.26.) SmallCNN was not searched at the patient level (it is not the
+# active model); its patient_threshold mirrors its patch_threshold.
 MODEL_SPECS: dict[str, ModelSpec] = {
     "ResNet18": ModelSpec(
         arch="resnet18",
         checkpoint=CHECKPOINTS_DIR / "resnet18_best.pt",
         image_size=128,
-        patch_threshold=0.3162,    # val-tuned patch recall, precision floor 0.70
-        patient_threshold=0.26,    # val-tuned per-patient patch recall (Phase 7)
+        patch_threshold=0.3845,    # val-tuned patch recall, precision floor 0.70
+        patient_threshold=0.3845,  # patient search agreed within 0.05 -> single t
         target_layer="layer4.1",   # == layer4[-1], last BasicBlock
     ),
     "SmallCNN": ModelSpec(

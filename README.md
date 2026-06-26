@@ -52,11 +52,16 @@ visualization, built as a clinical decision-support **research** tool.
   2-class head. Native 50×50 patches are upsampled to 128×128 for the network.
 - **Why ResNet18 over a custom CNN?** We pre-registered a head-to-head against a
   lightweight from-scratch `SmallCNN`. **ImageNet transfer learning won on every
-  metric that mattered** — tuned-threshold test recall (0.868 vs 0.831), PR-AUC
-  (0.889 vs 0.869), and ROC-AUC (0.952 vs 0.941). This contradicts the common
+  metric that mattered** — tuned-threshold test recall (0.890 vs 0.831), PR-AUC
+  (0.895 vs 0.869), and ROC-AUC (0.954 vs 0.941). This contradicts the common
   claim that tiny from-scratch CNNs beat transfer learning on 50×50 IDC patches;
   on a patient-level split with an honestly tuned threshold, transfer learning
   was better.
+- **Training:** AdamW (lr 2e-4, weight decay 1e-4) with cosine LR annealing,
+  light label smoothing (0.05), class-weighted cross-entropy, and early stopping
+  on validation PR-AUC. An earlier 3-epoch / lr-1e-3 baseline peaked within one
+  epoch and was undertrained; the slower, regularised schedule lifts test ROC-AUC
+  0.952→0.954, PR-AUC 0.889→0.895, and per-patient worst-case recall 0.426→0.626.
 - **Checkpoint selection:** the best epoch by **validation PR-AUC**. PR-AUC is
   threshold-independent and robust to the ~2.5:1 class imbalance, so it cannot be
   gamed by a trivially high-recall / low-precision epoch the way raw recall can.
@@ -72,16 +77,16 @@ threshold or checkpoint choice.
 
 | Recall | Precision | F1 | ROC-AUC | PR-AUC | Threshold |
 |-------:|----------:|---:|--------:|-------:|----------:|
-|  0.868 |     0.787 | 0.825 | 0.952 | 0.889 | 0.3162 |
+|  0.890 |     0.770 | 0.825 | 0.954 | 0.895 | 0.3845 |
 
 **Patient-level — per-patient *patch* recall** (the meaningful patient metric for
 this dataset). For each cancer patient: *what fraction of their IDC-positive
 patches does the model correctly flag?* Reported at the deployed patient-level
-threshold (0.26), across all 45 test patients:
+threshold (0.3845), across all 45 test patients:
 
 | Mean recall | Std | Median | Min | Max |
 |------------:|----:|-------:|----:|----:|
-|       0.865 | 0.118 | 0.902 | 0.426 | 0.989 |
+|       0.873 | 0.095 | 0.901 | 0.626 | 0.987 |
 
 > **Why not a single patient "accuracy"?** Because there is no negative class:
 > **all 45 test patients are IDC-positive**. Binary patient classification
@@ -91,10 +96,11 @@ threshold (0.26), across all 45 test patients:
 > to interpret without true-negative patients; treat per-patient recall as the
 > headline.
 
-The single-patch view and the per-patient (batch) view use **separate VAL-tuned
-thresholds** (0.3162 and 0.26 respectively), because "is this one patch
-malignant?" and "how much of this patient's IDC tissue did we catch?" are
-different questions. See `app/config.py`.
+The single-patch view and the per-patient (batch) view are tuned on VAL as
+separate questions — "is this one patch malignant?" vs. "how much of this
+patient's IDC tissue did we catch?". For the retrained model their VAL optima
+agree within tolerance (patch 0.3845, patient search t\*=0.35, |Δ|=0.035 ≤ 0.05),
+so both views deploy the **single threshold 0.3845**. See `app/config.py`.
 
 ## Grad-CAM notes
 

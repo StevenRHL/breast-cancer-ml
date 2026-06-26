@@ -158,10 +158,18 @@ def run_training(args: argparse.Namespace) -> dict:
     weights = train_class_weights(train_loader, device)
     print(f"[{args.arch}] class weights (benign, malignant) = "
           f"{weights.tolist()}", flush=True)
-    criterion = nn.CrossEntropyLoss(weight=weights)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=1)
+    # Light label smoothing regularises the head and improves probability
+    # calibration; the operating threshold is still tuned on val in Phase 5.
+    criterion = nn.CrossEntropyLoss(
+        weight=weights, label_smoothing=args.label_smoothing)
+    # AdamW (decoupled weight decay) regularises the fine-tuned backbone better
+    # than plain Adam. Cosine annealing decays the LR smoothly across the run —
+    # the previous ReduceLROnPlateau never engaged in the short 3-epoch baseline,
+    # leaving the model undertrained with val PR-AUC still climbing.
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
 
     log_path = os.path.join(LOG_DIR, f"phase3_{args.arch}.jsonl")
     ckpt_path = os.path.join(CKPT_DIR, f"{args.arch}_best.pt")
@@ -174,7 +182,7 @@ def run_training(args: argparse.Namespace) -> dict:
             val_m = evaluate(model, val_loader, device)
             test_m = evaluate(model, test_loader, device)
             score = val_m[SELECTION_METRIC]  # selection signal: val PR-AUC only
-            scheduler.step(score)
+            scheduler.step()  # cosine schedule advances once per epoch
             record = {
                 "arch": args.arch, "epoch": epoch, "train_loss": loss,
                 "lr": optimizer.param_groups[0]["lr"],
@@ -207,13 +215,17 @@ def run_training(args: argparse.Namespace) -> dict:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train an IDC patch classifier.")
     p.add_argument("--arch", required=True, choices=ARCHITECTURES)
-    p.add_argument("--epochs", type=int, default=12)
+    p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--batch-size", dest="batch_size", type=int, default=256)
     p.add_argument("--eval-batch-size", dest="eval_batch_size", type=int, default=512)
     p.add_argument("--image-size", dest="image_size", type=int, default=0,
                    help="0 = arch default (resnet18:128, smallcnn:50)")
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--patience", type=int, default=3)
+    p.add_argument("--weight-decay", dest="weight_decay", type=float, default=1e-4,
+                   help="AdamW decoupled weight decay")
+    p.add_argument("--label-smoothing", dest="label_smoothing", type=float,
+                   default=0.05, help="CrossEntropy label smoothing")
+    p.add_argument("--patience", type=int, default=5)
     p.add_argument("--num-workers", dest="num_workers", type=int, default=6)
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
